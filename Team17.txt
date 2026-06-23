@@ -1,0 +1,357 @@
+/* **************************************************************************
+ * 國立成功大學工程科學暨創新概論 期末競賽
+ * 第17組控制程式 - Pure Pursuit 循跡自主導航車
+ * ************************************************************************** */
+
+// 1. 五路循跡感測器腳位設定
+#define SENSOR_1 36 // OUT1→P36/SVP,最左邊感測器
+#define SENSOR_2 39 // OUT2→P39/SVN,左中感測器
+#define SENSOR_3 34 // OUT3→P34,中間感測器
+#define SENSOR_4 35 // OUT4→P35,右中感測器
+#define SENSOR_5 4  // OUT5→P4,最右邊感測器
+
+// 感測器邏輯:白底 = HIGH, 黑線 = LOW。偵測到 LOW 時代表看到黑線
+const int BLACK_SIGNAL = LOW;
+
+// 2. L298N 馬達驅動腳位設定
+#define ENA 25 // P25, 控制左輪速度(PWM)
+#define IN1 26 // P26, 控制左輪方向
+#define IN2 27 // P27, 控制左輪方向
+#define ENB 33 // P33, 控制右輪速度(PWM)
+#define IN3 14 // P14, 控制右輪方向
+#define IN4 13 // P13, 控制右輪方向
+
+// 3. 安全系統與起跑腳位設定
+#define TSMS_PIN 32 // P32 TSMS 輔助訊號
+#define VLS_PIN  22 // P22 VLS 起跑按鈕
+#define ESTOP_PIN 23 // P23→E-STOP
+#define RESET_PIN 15 // P15 RESET
+
+// 4. RGB LED 狀態燈腳位設定
+#define GREEN_LED 18
+#define RED_LED   19
+#define BLUE_LED  21
+const bool RGB_COMMON_ANODE = false;
+const int LED_ON  = RGB_COMMON_ANODE ? LOW : HIGH;
+const int LED_OFF = RGB_COMMON_ANODE ? HIGH : LOW;
+
+// 5. 車輛狀態定義
+#define SAFE_STATE  0
+#define AUTO_STATE  1
+#define OTHER_STATE 2
+int carState = SAFE_STATE;
+
+// 6. PWM 設定
+#define PWM_FREQ       1000
+#define PWM_RESOLUTION 8
+#define ENA_CHANNEL    0
+#define ENB_CHANNEL    1
+
+// 7. Pure Pursuit 參數
+float sensorPos[5] = { 24.0, 12.0, 0.0, -12.0, -24.0 };
+float lookAheadDistance = 85.0;
+float wheelBase = 120.0;
+int baseSpeed = 150;
+int maxSpeed = 255;
+int minSpeed = 60;
+
+// 8. 尋線與安全變數
+unsigned long lostLineStart = 0;
+unsigned long lostLineLimit = 5000;
+float lastTargetY = 0;
+bool ebsLatched = false;
+bool vlsStarted = false;
+
+// 9. 函式宣告
+void setupPWM();
+void setLeftPWM(int speedValue);
+void setRightPWM(int speedValue);
+void updateASL(int state);
+void stopMotor();
+void setMotorSpeed(int leftSpeed, int rightSpeed);
+void setMotorSigned(int leftSpeed, int rightSpeed);
+void purePursuitLineFollow();
+void searchLine();
+bool isTSMSOn();
+bool isEStopPressed();
+void triggerEBS(String reason);
+
+// 10. setup() 初始化
+void setup() {
+    Serial.begin(115200);
+    
+    pinMode(SENSOR_1, INPUT);
+    pinMode(SENSOR_2, INPUT);
+    pinMode(SENSOR_3, INPUT);
+    pinMode(SENSOR_4, INPUT);
+    pinMode(SENSOR_5, INPUT);
+    
+    pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+    pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+    
+    setupPWM();
+    
+    pinMode(TSMS_PIN, INPUT_PULLUP);
+    pinMode(VLS_PIN, INPUT_PULLUP);
+    pinMode(ESTOP_PIN, INPUT_PULLUP);
+    pinMode(RESET_PIN, INPUT_PULLUP);
+    
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(RED_LED, OUTPUT);
+    pinMode(BLUE_LED, OUTPUT);
+    
+    stopMotor();
+    updateASL(SAFE_STATE);
+    
+    Serial.println("ESP32 Pure Pursuit Line Following Car Speed Boosted");
+}
+
+// 11. loop() 主程式
+void loop() {
+    // 檢查外部緊急煞車
+    if (isEStopPressed()) { 
+        triggerEBS("External emergency stop"); 
+    }
+    
+    // 如果系統處於 EBS 鎖定狀態
+    if (ebsLatched == true) {
+        stopMotor();
+        carState = SAFE_STATE;
+        updateASL(SAFE_STATE);
+        
+        // 檢查復歸條件：TSMS 開啟、未按下 E-STOP 且按下 RESET 鍵
+        if (isTSMSOn() && !isEStopPressed() && digitalRead(RESET_PIN) == LOW) {
+            ebsLatched = false;
+            vlsStarted = false;
+            lostLineStart = 0;
+            carState = OTHER_STATE;
+            updateASL(OTHER_STATE);
+            Serial.println("EBS Reset");
+            delay(300);
+        }
+        return;
+    }
+    
+    // 安全系統未就緒狀況
+    if (!isTSMSOn()) {
+        stopMotor();
+        vlsStarted = false;
+        lostLineStart = 0;
+        carState = SAFE_STATE;
+        updateASL(SAFE_STATE);
+        delay(100);
+        return;
+    }
+    
+    // 等待起跑按鈕 VLS 觸發
+    if (vlsStarted == false) {
+        stopMotor();
+        carState = OTHER_STATE;
+        updateASL(OTHER_STATE);
+        if (digitalRead(VLS_PIN) == LOW) {
+            vlsStarted = true;
+            lostLineStart = 0;
+            carState = AUTO_STATE;
+            updateASL(AUTO_STATE);
+            delay(300);
+        }
+        return;
+    }
+    
+    // 進入常規 Pure Pursuit 循跡控制
+    purePursuitLineFollow();
+}
+
+// 12. Pure Pursuit 循跡控制實作
+void purePursuitLineFollow() {
+    int s[5];
+    s[0] = digitalRead(SENSOR_1);
+    s[1] = digitalRead(SENSOR_2);
+    s[2] = digitalRead(SENSOR_3);
+    s[3] = digitalRead(SENSOR_4);
+    s[4] = digitalRead(SENSOR_5);
+    
+    int blackCount = 0;
+    float ySum = 0;
+    
+    for (int i = 0; i < 5; i++) {
+        if (s[i] == BLACK_SIGNAL) {
+            ySum += sensorPos[i];
+            blackCount++;
+        }
+    }
+    
+    // 斷線處理邏輯
+    if (blackCount == 0) {
+        carState = AUTO_STATE;
+        updateASL(AUTO_STATE);
+        if (lostLineStart == 0) { lostLineStart = millis(); }
+        
+        unsigned long lostTime = millis() - lostLineStart;
+        if (lostTime <= lostLineLimit) {
+            searchLine();
+        } else {
+            triggerEBS("Line lost more than 5 seconds");
+        }
+        return;
+    }
+    
+    // 正常抓到線，清除斷線計時
+    lostLineStart = 0;
+    carState = AUTO_STATE;
+    updateASL(AUTO_STATE);
+    
+    float targetY = ySum / blackCount;
+    lastTargetY = targetY;
+    
+    // 計算 Pure Pursuit 曲率
+    float curvature = (2.0 * targetY) / ((lookAheadDistance * lookAheadDistance) + (targetY * targetY));
+    
+    int leftSpeedOutput = baseSpeed;
+    int rightSpeedOutput = baseSpeed;
+    float sharpTurnThreshold = 15.0;
+    
+    // 急彎處理（極限差格反轉驅動）
+    if (targetY < -sharpTurnThreshold) {
+        leftSpeedOutput = maxSpeed;
+        rightSpeedOutput = -maxSpeed;
+        Serial.println("Sharp Turn: Right Axis Reversed (MAX SPEED)!");
+    }
+    else if (targetY > sharpTurnThreshold) {
+        leftSpeedOutput = -maxSpeed;
+        rightSpeedOutput = maxSpeed;
+        Serial.println("Sharp Turn: Left Axis Reversed (MAX SPEED)!");
+    }
+    else {
+        // 標準差速阿克曼幾何微調
+        float leftSpeedF = baseSpeed * (1.0 - (curvature * wheelBase / 2.0) * 1.5);
+        float rightSpeedF = baseSpeed * (1.0 + (curvature * wheelBase / 2.0) * 1.5);
+        leftSpeedOutput = constrain((int)leftSpeedF, minSpeed, maxSpeed);
+        rightSpeedOutput = constrain((int)rightSpeedF, minSpeed, maxSpeed);
+    }
+    
+    setMotorSigned(leftSpeedOutput, rightSpeedOutput);
+    
+    Serial.print("TargetY: "); Serial.print(targetY);
+    Serial.print(" L: "); Serial.print(leftSpeedOutput);
+    Serial.print(" R: "); Serial.println(rightSpeedOutput);
+    delay(20);
+}
+
+// 13. 尋線模式
+void searchLine() {
+    int searchSpeed = 150;
+    if (lastTargetY >= 0) {
+        setMotorSigned(-searchSpeed, searchSpeed);
+        Serial.println("Searching left...");
+    } else {
+        setMotorSigned(searchSpeed, -searchSpeed);
+        Serial.println("Searching right...");
+    }
+}
+
+// 14. TSMS 狀態判斷
+bool isTSMSOn() {
+    return digitalRead(TSMS_PIN) == LOW;
+}
+
+// 15. E-STOP 狀態判斷
+bool isEStopPressed() {
+    return digitalRead(ESTOP_PIN) == LOW;
+}
+
+// 16. EBS 緊急制動
+void triggerEBS(String reason) {
+    ebsLatched = true;
+    vlsStarted = false;
+    stopMotor();
+    carState = SAFE_STATE; 
+    updateASL(SAFE_STATE);
+    Serial.print("EBS Triggered: "); Serial.println(reason);
+}
+
+// 17. ASL 狀態燈控制
+void updateASL(int state) { 
+    if (state == SAFE_STATE) {
+        // 綠燈亮:安全狀態
+        digitalWrite(GREEN_LED, LED_ON);
+        digitalWrite(RED_LED, LED_OFF);
+        digitalWrite(BLUE_LED, LED_OFF); 
+    }
+    else if (state == AUTO_STATE) {
+        // 紅燈亮:自主導航狀態
+        digitalWrite(GREEN_LED, LED_OFF); 
+        digitalWrite(RED_LED, LED_ON);
+        digitalWrite(BLUE_LED, LED_OFF);
+    }
+    else {
+        // 藍燈亮:等待 VLS 或其他狀態
+        digitalWrite(GREEN_LED, LED_OFF); 
+        digitalWrite(RED_LED, LED_OFF);
+        digitalWrite(BLUE_LED, LED_ON);
+    }
+}
+
+// 18. 馬達控制:前進差速
+void setMotorSpeed(int leftSpeed, int rightSpeed) { 
+    leftSpeed = constrain(leftSpeed, 0, 255); 
+    rightSpeed = constrain(rightSpeed, 0, 255);
+    
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    setLeftPWM(leftSpeed);
+    
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    setRightPWM(rightSpeed);
+}
+
+// 19. 馬達控制:可前進/後退（正負號驅動）
+void setMotorSigned(int leftSpeed, int rightSpeed) { 
+    leftSpeed = constrain(leftSpeed, -255, 255); 
+    rightSpeed = constrain(rightSpeed, -255, 255);
+    
+    // 左輪正反轉控制
+    if (leftSpeed > 0) {
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); setLeftPWM(leftSpeed);
+    }
+    else if (leftSpeed < 0) {
+        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); setLeftPWM(-leftSpeed);
+    }
+    else {
+        digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); setLeftPWM(0);
+    }
+    
+    // 右輪正反轉控制
+    if (rightSpeed > 0) {
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); setRightPWM(rightSpeed);
+    }
+    else if (rightSpeed < 0) {
+        digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); setRightPWM(-rightSpeed);
+    }
+    else {
+        digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); setRightPWM(0);
+    }
+}
+
+// 20. 馬達停止
+void stopMotor() { 
+    setLeftPWM(0); 
+    setRightPWM(0);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); 
+}
+
+// 21. ESP32 底層 PWM 初始化與驅動實作
+void setupPWM() {
+    ledcSetup(ENA_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(ENA, ENA_CHANNEL);
+    ledcSetup(ENB_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(ENB, ENB_CHANNEL);
+}
+
+void setLeftPWM(int speedValue) {
+    ledcWrite(ENA_CHANNEL, speedValue);
+}
+
+void setRightPWM(int speedValue) {
+    ledcWrite(ENB_CHANNEL, speedValue);
+}
